@@ -1,18 +1,20 @@
 // @ts-ignore
 const Me = imports.misc.extensionUtils.getCurrentExtension();
 
-import * as Lib from 'lib';
-import * as Tags from 'tags';
-import * as Log from 'log';
 import * as GrabOp from 'grab_op';
+import * as Lib from 'lib';
+import * as Log from 'log';
+import * as Node from 'node';
 import * as Rect from 'rectangle';
-import * as window from 'window';
 import * as shell from 'shell';
+import * as Tags from 'tags';
 import * as Tweener from 'tweener';
+import * as window from 'window';
 
 import type { Entity } from './ecs';
 import type { Rectangle } from './rectangle';
 import type { Ext } from './extension';
+import type { NodeWindow, NodeStack } from './node';
 import { AutoTiler } from './auto_tiler';
 
 const { Meta } = imports.gi;
@@ -141,10 +143,101 @@ export class Tiler {
         return this;
     }
 
-    move(ext: Ext, x: number, y: number, w: number, h: number, focus: () => window.ShellWindow | number | null) {
+    move(ext: Ext, x: number, y: number, w: number, h: number, direction: Direction, focus: () => window.ShellWindow | number | null) {
         if (!this.window) return;
         if (ext.auto_tiler && !ext.contains_tag(this.window, Tags.Floating)) {
-            this.move_auto(ext, focus());
+            const focused = ext.focus_window();
+            if (focused) {
+                const move_to = focus();
+
+                // Check if the focused window is in a stack first.
+                if (ext.auto_tiler) {
+                    const s = ext.auto_tiler.find_stack(focused.entity);
+                    if (s) {
+                        const [fork, branch, is_left] = s;
+                        const stack = branch.inner as NodeStack;
+
+                        switch (direction) {
+                            // Move focused window in stack to the left
+                            case Direction.Left:
+                                if (!Node.stack_move_left(stack, focused.entity)) {
+                                    if (move_to !== null && move_to instanceof ShellWindow) {
+                                        this.move_auto(ext, focused, move_to);
+                                    } else {
+                                        if (fork.right === null) {
+                                            fork.right = fork.left;
+                                            fork.left = Node.Node.window(focused.entity);
+                                        } else {
+                                            const forest = ext.auto_tiler.forest;
+                                            const new_fork = forest.create_fork(
+                                                Node.Node.window(focused.entity),
+                                                branch,
+                                                fork.area,
+                                                fork.workspace
+                                            );
+
+                                            new_fork[1].set_orientation(Lib.Orientation.HORIZONTAL);
+
+                                            if (is_left) {
+                                                fork.left = Node.Node.fork(new_fork[0]);
+                                            } else {
+                                                fork.right = Node.Node.fork(new_fork[0]);
+                                            }
+
+                                            // Update parent assignments
+                                            forest.on_attach(fork.entity, focused.entity);
+                                            for (const e of stack.entities) {
+                                                forest.on_attach(fork.entity, e);
+                                            }
+                                        }
+
+                                        ext.auto_tiler.tile(ext, fork, fork.area);
+                                    }
+                                }
+
+                                ext.auto_tiler.update_stack(ext, stack);
+
+                                return;
+                            // Move focused window in stack to the right
+                            case Direction.Right:
+                                if (!Node.stack_move_right(stack, focused.entity)) {
+                                    if (move_to !== null && move_to instanceof ShellWindow) {
+                                        this.move_auto(ext, focused, move_to);
+                                    } else {
+
+                                        const forest = ext.auto_tiler.forest;
+                                        const new_fork = forest.create_fork(
+                                            branch,
+                                            Node.Node.window(focused.entity),
+                                            fork.area,
+                                            fork.workspace
+                                        );
+
+                                        if (is_left) {
+                                            fork.left = Node.Node.fork(new_fork[0]);
+                                        } else {
+                                            fork.right = Node.Node.fork(new_fork[0]);
+                                        }
+
+                                        // Update parent assignments
+                                        forest.on_attach(fork.entity, focused.entity);
+                                        for (const e of stack.entities) {
+                                            forest.on_attach(fork.entity, e);
+                                        }
+                                    }
+
+                                    ext.auto_tiler.tile(ext, fork, fork.area);
+                                }
+
+                                ext.auto_tiler.update_stack(ext, stack);
+
+                                return;
+                        }
+                    }
+                }
+
+                if (move_to !== null) this.move_auto(ext, focused, move_to);
+            }
         } else {
             this.swap_window = null;
             this.rect_by_active_area(ext, (_monitor, rect) => {
@@ -284,33 +377,52 @@ export class Tiler {
         );
     }
 
-    move_auto(ext: Ext, move_to: window.ShellWindow | number | null) {
-        if (move_to === null) return;
-
-        const focused = ext.focus_window();
+    move_auto(ext: Ext, focused: window.ShellWindow, move_to: window.ShellWindow | number) {
         let watching: null | window.ShellWindow = null;
 
-        if (ext.auto_tiler && focused) {
+        if (ext.auto_tiler) {
+            ext.auto_tiler.detach_window(ext, focused.entity);
+
             if (move_to instanceof ShellWindow) {
-                const parent = ext.auto_tiler.windows_are_siblings(focused.entity, move_to.entity);
-                if (parent) {
-                    const fork = ext.auto_tiler.forest.forks.get(parent);
+                // Check if we are moving onto a stack, and if so, move into the stack.
+                const stack_info = ext.auto_tiler.find_stack(move_to.entity);
+                if (stack_info) {
+                    const fork = ext.auto_tiler.get_parent_fork(focused.entity);
                     if (fork) {
-                        const temp = fork.left.entity;
-                        fork.left.entity = (fork.right as any).entity;
-                        (fork.right as any).entity = temp;
-                        ext.auto_tiler.tile(ext, fork, fork.area as any);
-                        watching = focused
+                        const [stack_fork, branch,] = stack_info;
+                        const stack = branch.inner as NodeStack;
+
+                        stack.entities.unshift(focused.entity);
+                        ext.auto_tiler.update_stack(ext, stack);
+
+                        ext.auto_tiler.tile(ext, fork, fork.area);
+                        ext.auto_tiler.tile(ext, stack_fork, stack_fork.area);
+
+                        watching = focused;
+                    }
+                } else {
+                    const parent = ext.auto_tiler.windows_are_siblings(focused.entity, move_to.entity);
+                    if (parent) {
+                        const fork = ext.auto_tiler.forest.forks.get(parent);
+                        if (fork) {
+                            // Move the right window to the left, and the left window to the right.
+                            const temp = (fork.left.inner as NodeWindow).entity;
+
+                            if (!fork.right) return;
+
+                            (fork.left.inner as NodeWindow).entity = (fork.right.inner as NodeWindow).entity;
+                            (fork.right.inner as NodeWindow).entity = temp;
+                            ext.auto_tiler.tile(ext, fork, fork.area);
+                            watching = focused
+                        }
                     }
                 }
 
                 if (!watching) {
-                    ext.auto_tiler.detach_window(ext, focused.entity);
                     ext.auto_tiler.attach_to_window(ext, move_to, focused, Lib.cursor_rect());
                     watching = focused;
                 }
             } else {
-                ext.auto_tiler.detach_window(ext, focused.entity);
                 ext.auto_tiler.attach_to_monitor(ext, focused, [move_to, ext.active_workspace()]);
                 watching = focused;
             }
@@ -329,7 +441,7 @@ export class Tiler {
     }
 
     move_left(ext: Ext) {
-        this.move(ext, -1, 0, 0, 0, move_window_or_monitor(
+        this.move(ext, -1, 0, 0, 0, Direction.Left, move_window_or_monitor(
             ext,
             ext.focus_selector.left,
             Meta.DisplayDirection.LEFT
@@ -337,7 +449,7 @@ export class Tiler {
     }
 
     move_down(ext: Ext) {
-        this.move(ext, 0, 1, 0, 0, move_window_or_monitor(
+        this.move(ext, 0, 1, 0, 0, Direction.Down, move_window_or_monitor(
             ext,
             ext.focus_selector.down,
             Meta.DisplayDirection.DOWN
@@ -345,7 +457,7 @@ export class Tiler {
     }
 
     move_up(ext: Ext) {
-        this.move(ext, 0, -1, 0, 0, move_window_or_monitor(
+        this.move(ext, 0, -1, 0, 0, Direction.Up, move_window_or_monitor(
             ext,
             ext.focus_selector.up,
             Meta.DisplayDirection.UP
@@ -353,7 +465,7 @@ export class Tiler {
     }
 
     move_right(ext: Ext) {
-        this.move(ext, 1, 0, 0, 0, move_window_or_monitor(
+        this.move(ext, 1, 0, 0, 0, Direction.Right, move_window_or_monitor(
             ext,
             ext.focus_selector.right,
             Meta.DisplayDirection.RIGHT
